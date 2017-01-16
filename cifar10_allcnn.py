@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 Created on Tue Jul 19 13:13:53 2016
-
 @author: jeandut
 """
 
+from __future__ import print_function
 import numpy as np
 import tensorflow as tf
 import os
 import cPickle as pickle
 import argparse
 import dataset_class as dataset
+import  sys
 #
 parser=argparse.ArgumentParser(description="Testing All-CNN on CIFAR-10 global contrast normalised and whitened without data-augmentation.")
 parser.add_argument('--learning_rate', default=0.05, help="Initial Learning Rate")
 parser.add_argument('--weight_decay',default=0.001, help="weight decay")
-parser.add_argument('--data_dir',default="../data", help="Directory with cifar-10-batches-py")
+parser.add_argument('--data_dir',default="/home/shared/alham/grad_drop_experiment/", help="Directory with cifar-10-batches-py")
 
 args=parser.parse_args()
 
@@ -23,11 +24,34 @@ WD=float(args.weight_decay)
 starter_learning_rate=float(args.learning_rate)
 batchdir=os.path.join(args.data_dir,"cifar-10-batches-py")
 
-workdir=os.getcwd()
-
+workdir='/home/shared/alham/grad_drop_experiment/cifar-10-batches-py/'
+ 
 BATCH_SIZE=128
 EPSILON_SAFE_LOG=np.exp(-50.)
+SEED=321
+PROPAGATE_ERROR = True
+GRADIENT_DROP = True
+CLASS_DIM = 16
+DROP_RATE = 50
 
+# tf.set_random_seed(SEED)
+
+# note that you will still get slightly undeterministic result when you run the code under GPUs due to the GPUs nature. 
+
+def grad_drop(input_grad, rate):
+    old_shape = input_grad.get_shape()
+    grad = tf.reshape(input_grad, [-1])
+    size = grad.get_shape().as_list()[0]
+    k = tf.maximum(1, (size * (100 - rate) ) // 100)
+    v, _ = tf.nn.top_k(abs(grad), k)
+    cut_point = v[-1]
+    dropped_grad = tf.select(tf.less(abs(grad), cut_point), tf.zeros_like(grad), grad)
+    return tf.reshape(dropped_grad, old_shape)
+
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+    
 #Loading CIFAR-10 from data_dir directory
 #The full code for the preprocessing is taken from nervana neon repository Image.py which is also inspired from pylearn2
 
@@ -105,14 +129,13 @@ X_test=global_contrast_normalize(X_test, scale= norm_scale)
 zca_cache=os.path.join(workdir,'cifar-10-zca-cache.pkl')
 X_train, X_test=zca_whiten(X_train, X_test, cache=zca_cache)
 
-
 #Reformatting data as images
 X_train=X_train.reshape((X_train.shape[0],3,32,32)).transpose((0,2,3,1))
 X_test=X_test.reshape((X_test.shape[0],3,32,32)).transpose((0,2,3,1))
 
 #Reformatting labels with 16 one-hot encoding
-one_hot_train=np.zeros((y_train.shape[0],16),dtype="int64")
-one_hot_test=np.zeros((y_test.shape[0],16),dtype="int64")
+one_hot_train=np.zeros((y_train.shape[0],CLASS_DIM),dtype="int64")
+one_hot_test=np.zeros((y_test.shape[0],CLASS_DIM),dtype="int64")
 
 for i in xrange(y_train.shape[0]):
     one_hot_train[i,y_train[i]]=1
@@ -124,43 +147,37 @@ y_test=one_hot_test.astype("float32")
 
 CIFAR10=dataset.read_data_sets(X_train,y_train, X_test, y_test, None, False)
  
+
+grad_errors = []
+
 def _variable_with_weight_decay(shape,wd=WD):
     
-    initial=tf.random_normal(shape,stddev=0.05)
+    initial=tf.random_normal(shape,stddev=0.05,  seed=SEED)
     
     var=tf.Variable(initial)
     
     if wd is not None:
         weight_decay=tf.mul(tf.nn.l2_loss(var), wd, name="weight_loss")
         tf.add_to_collection("losses", weight_decay)
+
+    # for gradient drop error
+    grad_errors.append( tf.Variable(tf.zeros(shape), trainable=False) )
         
     return var
-
     
-def conv(input_tensor,W):
+def conv(input_tensor, W, b, stride=1, padding="SAME"):
+    _x = tf.nn.conv2d(input_tensor, W, strides=[1, stride, stride, 1], padding=padding)
+    return tf.nn.relu(_x + b)
     
-    return tf.nn.conv2d(input_tensor, W, strides=[1, 1, 1, 1], padding="VALID")
-    
-def convp1(input_tensor,W):
-    
-    return tf.nn.conv2d(input_tensor, W, strides=[1, 1, 1, 1], padding="SAME")
-    
-def convp1s2(input_tensor,W):
-    
-    return tf.nn.conv2d(input_tensor, W, strides=[1, 2, 2, 1], padding="SAME")
-    
-def avg_pool(input_tensor):
-    return tf.nn.avg_pool(input_tensor, ksize=[1, 8, 8, 1], strides=[1, 8, 8, 1], padding="VALID")
+def avg_pool(input_tensor, k=2, stride=2):
+    return tf.nn.avg_pool(input_tensor, ksize=[1, k, k, 1], strides=[1, stride, stride, 1], padding="VALID")
     
 def safelog(input_tensor):
     return tf.log(input_tensor+EPSILON_SAFE_LOG)
-    
-    
+
 
 x=tf.placeholder(dtype=tf.float32, shape= [None, 32, 32, 3])
-
-#Padding to 16 classes to match Neon implementation
-y_=tf.placeholder(dtype=tf.float32, shape= [None, 16])
+y_=tf.placeholder(dtype=tf.float32, shape= [None, CLASS_DIM])
 
 #Placeholders for the dropout probabilities
 keep_prob_input=tf.placeholder(tf.float32)
@@ -170,7 +187,7 @@ global_step=tf.Variable(0, trainable=False)
 
 
 #Scheduling learning rate to drop from starter_learning_rate by a factor 10 after 200, 250 and 300 epochs with Momentum optimizer with momentum=0.9
-def train(total_loss, global_step):
+def get_optimizer(global_step):
     
     NUM_EPOCHS_PER_DECAY_1=200
     NUM_EPOCHS_PER_DECAY_2=250
@@ -182,10 +199,6 @@ def train(total_loss, global_step):
     decay_steps_1=int(num_batches_per_epoch*NUM_EPOCHS_PER_DECAY_1)
     decay_steps_2=int(num_batches_per_epoch*NUM_EPOCHS_PER_DECAY_2)
     decay_steps_3=int(num_batches_per_epoch*NUM_EPOCHS_PER_DECAY_3)
-    
-    
-    
-    
     
     decayed_learning_rate_1=tf.train.exponential_decay(starter_learning_rate, 
                                                      global_step, 
@@ -207,85 +220,33 @@ def train(total_loss, global_step):
                                                      
     lr=decayed_learning_rate_3
     
-    return tf.train.MomentumOptimizer(lr,0.9).minimize(total_loss,global_step) 
+    return tf.train.MomentumOptimizer(lr,0.9)
 
 
-#Building Network
+def connect_conv(input_tensor, shape, stride=1, padding = "SAME"):
+    bias_size = shape[3]
+    __w = _variable_with_weight_decay(shape)
+    __b = _variable_with_weight_decay([bias_size])
+    return conv(input_tensor, __w, __b, stride, padding)
 
 def inference(x_input):
+    x_dropped=tf.nn.dropout(x_input, keep_prob=keep_prob_input, seed= SEED)
+    
+    conv1 = connect_conv(x_dropped, [3, 3, 3, 96] )
+    conv2 = connect_conv(conv1, [3, 3, 96, 96] )
+    conv3 = connect_conv(conv2, [3, 3, 96, 96] , stride=2)
+    conv3_dropped=tf.nn.dropout(conv3, keep_prob=keep_prob_layers, seed= SEED)
 
+    conv4 = connect_conv(conv3_dropped, [3, 3, 96, 192] )
+    conv5 = connect_conv(conv4, [3, 3, 192, 192] )
+    conv6 = connect_conv(conv5, [3, 3, 192, 192],  stride=2)
+    conv6_dropped=tf.nn.dropout(conv6, keep_prob=keep_prob_layers, seed= SEED)
     
-    x_dropped=tf.nn.dropout(x_input, keep_prob=keep_prob_input)
-    
-    W_conv1=_variable_with_weight_decay([3,3,3,96])
-    b_conv1=_variable_with_weight_decay([96])
-    
-    conv_int=convp1(x_dropped, W_conv1)
-    biases=tf.nn.bias_add(conv_int, b_conv1)
-    conv1=tf.nn.relu(biases)
-    
-    W_conv2=_variable_with_weight_decay([3,3,96,96])
-    b_conv2=_variable_with_weight_decay([96])
-    
-    conv_int=convp1(conv1, W_conv2)
-    biases=tf.nn.bias_add(conv_int, b_conv2)
-    conv2=tf.nn.relu(biases)
-    
-    W_conv3=_variable_with_weight_decay([3,3,96,96])
-    b_conv3=_variable_with_weight_decay([96])
-    
-    conv_int=convp1s2(conv2, W_conv3)
-    biases=tf.nn.bias_add(conv_int, b_conv3)
-    conv3=tf.nn.relu(biases)
-    
-    conv3_dropped=tf.nn.dropout(conv3, keep_prob=keep_prob_layers)
-    
-    W_conv4=_variable_with_weight_decay([3,3,96,192])
-    b_conv4=_variable_with_weight_decay([192])
-    
-    conv_int=convp1(conv3_dropped, W_conv4)
-    biases=tf.nn.bias_add(conv_int, b_conv4)
-    conv4=tf.nn.relu(biases)
-    
-    W_conv5=_variable_with_weight_decay([3,3,192,192])
-    b_conv5=_variable_with_weight_decay([192])
-    
-    conv_int=convp1(conv4, W_conv5)
-    biases=tf.nn.bias_add(conv_int, b_conv5)
-    conv5=tf.nn.relu(biases)
-    
-    W_conv6=_variable_with_weight_decay([3,3,192,192])
-    b_conv6=_variable_with_weight_decay([192])
-    
-    conv_int=convp1s2(conv5, W_conv6)
-    biases=tf.nn.bias_add(conv_int, b_conv6)
-    conv6=tf.nn.relu(biases)
-    
-    conv6_dropped=tf.nn.dropout(conv6, keep_prob=keep_prob_layers)
-    
-    W_conv7=_variable_with_weight_decay([3,3,192,192])
-    b_conv7=_variable_with_weight_decay([192])
-    
-    conv_int=convp1(conv6_dropped, W_conv7)
-    biases=tf.nn.bias_add(conv_int, b_conv7)
-    conv7=tf.nn.relu(biases)
-    
-    W_conv8=_variable_with_weight_decay([1,1,192,192])
-    b_conv8=_variable_with_weight_decay([192])
-    
-    conv_int=conv(conv7, W_conv8)
-    biases=tf.nn.bias_add(conv_int, b_conv8)
-    conv8=tf.nn.relu(biases)
-    
-    W_conv9=_variable_with_weight_decay([1,1,192,16])
-    b_conv9=_variable_with_weight_decay([16])
-    
-    conv_int=conv(conv8, W_conv9)
-    biases=tf.nn.bias_add(conv_int, b_conv9)
-    conv9=tf.nn.relu(biases)
-    
-    logits=avg_pool(conv9)
-    
+    conv7 = connect_conv(conv6_dropped, [3, 3, 192, 192])
+    conv8 = connect_conv(conv7, [1, 1, 192, 192], padding="VALID")
+    conv9 = connect_conv(conv8, [1, 1, 192, CLASS_DIM], padding="VALID")
+    logits=avg_pool(conv9, 8, 8)
+
     return logits
 
     
@@ -304,50 +265,74 @@ def acc(y_pred, labels):
 
 logits=inference(x)
 
-pred=tf.nn.softmax(tf.reshape(logits,(-1,16)))
+pred=tf.nn.softmax(tf.reshape(logits,(-1,CLASS_DIM)))
 
 loss=ce(pred, y_)
 
-train_step=train(loss, global_step)
+optimizer=get_optimizer(global_step)
+grad_and_vars = optimizer.compute_gradients(loss) 
+
+
+if GRADIENT_DROP:  
+    drop_rate = tf.placeholder(tf.int32)
+    print('Training with gradient drop rate of ', DROP_RATE)
+    final_grads = [grad + (0.5 * prev_grad) for prev_grad, (grad, _) in zip(grad_errors, grad_and_vars)]
+    isflush = tf.placeholder(tf.bool)
+    
+    dropped_grads = [(grad_drop(final_grad, drop_rate), var) for final_grad, (_, var) in zip(final_grads, grad_and_vars) ]
+ 
+    error_update_ops = []
+    if PROPAGATE_ERROR:
+        print('Propagating the Error')
+        idx = 0
+        for (drop_grad, _ ),  final_grad in zip(dropped_grads, final_grads):
+            error_update_ops.append( tf.assign(grad_errors[idx] , final_grad - drop_grad) )
+            idx += 1
+    train_step = optimizer.apply_gradients(dropped_grads, global_step = global_step)
+else:
+    print('Training without gradient drop')
+    train_step = optimizer.apply_gradients(grad_and_vars, global_step = global_step)
 
 accuracy=acc(pred, y_)
 
-saver=tf.train.Saver()
-
 sess=tf.Session()
 sess.run(tf.initialize_all_variables())
-
 #Going through 350 epochs (there is 390 batches by epoch)
 STEPS, ACC_TRAIN, COST_TRAIN=[], [], []
-
+dr = DROP_RATE
 for i in xrange(0,136500):
     batch=CIFAR10.train.next_batch(128)
+    if i%1000==0:
+        FINAL_ACC=0.
+        for j in xrange(0,10):
+            FINAL_ACC+=0.1*sess.run(accuracy, feed_dict={x: CIFAR10.test.images[j*1000:(j+1)*1000], y_: CIFAR10.test.labels[j*1000:(j+1)*1000], keep_prob_input: 1., keep_prob_layers: 1.}) 
+        print("current eval accuracy :", FINAL_ACC)
+        eprint("current eval accuracy :", FINAL_ACC)
+
     if i%100==0:
+        
         acc_batch, loss_batch = sess.run([accuracy, loss], feed_dict={x: batch[0], y_: batch[1], keep_prob_input: 1., keep_prob_layers: 1.})
-        print "Step: %s, Acc: %s, Loss: %s"%(i,acc_batch, loss_batch)
+        print("Step: %s, Acc: %s, Loss: %s"%(i,acc_batch, loss_batch))
+        eprint("Step: %s, Acc: %s, Loss: %s"%(i,acc_batch, loss_batch))
         
         STEPS.append(i)
         ACC_TRAIN.append(acc_batch)
         COST_TRAIN.append(loss_batch)
-        
-    sess.run(train_step, feed_dict={x: batch[0], y_: batch[1], keep_prob_input: 0.8, keep_prob_layers: 0.5})
+    ops = [dropped_grads, train_step]
+
+    if GRADIENT_DROP and PROPAGATE_ERROR:
+        for u in error_update_ops:
+            ops.append(u)
+
+    ret = sess.run(ops, feed_dict={x: batch[0], y_: batch[1], keep_prob_input: 0.8, keep_prob_layers: 0.5, drop_rate:dr })
+
+
     
-save_path= saver.save(sess,"../temp/CIFAR10_allcnn")   
-print "Model saved in file: ", save_path  
-
-
-with open('../temp/CIFAR10_allcnn_training_info.pkl','wb') as output:
-    pickle.dump(STEPS,output,pickle.HIGHEST_PROTOCOL)
-    pickle.dump(ACC_TRAIN,output,pickle.HIGHEST_PROTOCOL)
-    pickle.dump(COST_TRAIN,output,pickle.HIGHEST_PROTOCOL)
-
-
 FINAL_ACC=0.
 for i in xrange(0,10):
     FINAL_ACC+=0.1*sess.run(accuracy, feed_dict={x: CIFAR10.test.images[i*1000:(i+1)*1000], y_: CIFAR10.test.labels[i*1000:(i+1)*1000], keep_prob_input: 1., keep_prob_layers: 1.}) 
    
     
-print "Final accuracy on test set:", FINAL_ACC    
+print("Final accuracy on test set:", FINAL_ACC)  
     
-    
-    
+ 
