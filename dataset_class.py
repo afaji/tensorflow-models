@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 Created on Mon Mar  7 10:43:13 2016
-
 @author: jeandut
 """
 import numpy as np
 import tensorflow as tf
 from scipy import ndimage
 
+SEED = 321
+print("setting seed")
+np.random.seed(SEED) 
 
 #This is me reimplementing dataset_class which can be found in tensorflow MNIST tutorial
 class DataSet(object):
